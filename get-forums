@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from html.parser import HTMLParser
+from html import escape as html_escape
 from re import sub as subst
 from sys import argv, exit
 
@@ -109,12 +110,34 @@ def print_text_impl(forum, level):
 	for frm in forum.children:
 		print_text_impl(frm, level + 1)
 
-def print_text(forum):
-	print_text_impl(forum, 0)
+def print_text(forums):
+	for f in forums:
+		print_text_impl(f, 0)
 
 # html output
-def print_html(forum):
-	exit('HTML output is not implemented yet.')
+def print_html_forums(forums):
+	for f in forums:
+		if f.fid:
+			print('<li><a href="http://rutracker.org/forum/viewforum.php?f={0}">{1}</a>'
+					.format(f.fid, html_escape(f.title)))
+		else:
+			print('<li><h3>{0}</h3>'.format(html_escape(f.title)))
+
+		if f.children:
+			print('<ul>')
+			print_html_forums(f.children)
+			print('</ul>')
+
+		print('</li>')
+
+def print_html(forums):
+	print('''<!DOCTYPE HTML><html><head><meta charset="utf-8"/>
+<title>Список форумов</title>
+<style> ul { list-style-type: disc; } </style>
+</head><body><ul>''')
+
+	print_html_forums(forums)
+	print('</ul></body></html>')
 
 # output handler map
 output_map = {
@@ -145,6 +168,5 @@ reader = ForumListReader()
 reader.feed(Path(src).read_text(encoding = "windows-1251"))
 
 # generate output
-for forum in reader.root.children:
-	output(forum)
+output(reader.root.children)
 
