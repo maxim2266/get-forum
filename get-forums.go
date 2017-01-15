@@ -5,24 +5,46 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
-	"regexp"
-	"strconv"
 	"strings"
 
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/charset"
 )
 
+// forum data structure
+type Forum struct {
+	parent   *Forum
+	id       uint
+	title    string
+	children []*Forum
+}
+
 func main() {
-	forums, err := readForumTree("forums.html")
+	// open file
+	file, err := os.Open("forums.html")
 
 	if err != nil {
 		die(err)
 	}
 
-	printForums(forums)
+	defer file.Close()
+
+	// tokenizer
+	z, err := TokenizerFromReader(file)
+
+	if err != nil {
+		die(err)
+	}
+
+	// print tokens
+	for t := z.Next(); t != nil; t = z.Next() {
+		fmt.Printf("[%s] %q -> %q\n", t.Type, string(t.Key), string(t.Value))
+	}
+
+	if z.Error != io.EOF {
+		die(z.Error)
+	}
 }
 
 // plain text print-out
@@ -44,361 +66,158 @@ func printForum(forum *Forum, level int) {
 	}
 }
 
-// tokenizer manager
-func withTokenizer(fileName string, fn func(reader *html.Tokenizer) error) error {
-	// open file
-	file, err := os.Open(fileName)
+// HTML token type
+type TokenType uint32
+
+const (
+	TokenStartTag TokenType = iota
+	TokenEndTag
+	TokenText
+	TokenComment
+	TokenDoctype
+	TokenAttribute
+)
+
+func (tt TokenType) String() string {
+	switch tt {
+	case TokenStartTag:
+		return "StartTag"
+	case TokenEndTag:
+		return "EndTag"
+	case TokenText:
+		return "Text"
+	case TokenComment:
+		return "Comment"
+	case TokenDoctype:
+		return "Doctype"
+	case TokenAttribute:
+		return "Attribute"
+	}
+
+	return fmt.Sprintf("[unknown token type %d]", tt)
+}
+
+// HTML token
+type Token struct {
+	Type       TokenType
+	Key, Value []byte
+}
+
+// tokenizer
+type Tokenizer struct {
+	tokenizer       *html.Tokenizer
+	token           Token
+	inAttr, inShort bool
+	Error           error
+}
+
+// tokenizer constructor
+func TokenizerFromReader(r io.Reader) (*Tokenizer, error) {
+	reader, err := charset.NewReader(r, "utf-8")
 
 	if err != nil {
-		return err
-	}
-
-	defer file.Close()
-
-	// wrap file into a reader for the appropriate charset
-	reader, err := charset.NewReader(file, "utf-8")
-
-	if err != nil {
-		return err
-	}
-
-	// tokenizer
-	tokenizer := html.NewTokenizer(reader)
-
-	// find starting point and invoke callback
-	if err = findAnchor(tokenizer); err == nil {
-		err = fn(tokenizer)
-	}
-
-	// check error
-	switch err {
-	case nil:
-		// discard the rest of the input
-		_, err = io.Copy(ioutil.Discard, file) // to prevent the sending process from getting SIGPIPE
-		return err
-	case io.EOF:
-		// all done
-		return nil
-	default:
-		// got some error
-		return err
-	}
-}
-
-// forum data structure
-type Forum struct {
-	parent   *Forum
-	id       uint
-	title    string
-	children []*Forum
-}
-
-func newChildForum(parent *Forum) *Forum {
-	forum := &Forum{parent: parent}
-	parent.children = append(parent.children, forum)
-	return forum
-}
-
-// parser
-func readForumTree(fileName string) ([]*Forum, error) {
-	root := new(Forum)
-	current := root
-
-	// parser actions
-	addChild := func(_ *html.Tokenizer) error {
-		current = newChildForum(current)
-		return nil
-	}
-
-	stepUp := func(_ *html.Tokenizer) error {
-		current = current.parent
-		return nil
-	}
-
-	cTitle := func(tkz *html.Tokenizer) (err error) {
-		current.title, err = findAttribute("title", tkz)
-		return
-	}
-
-	href := func(tkz *html.Tokenizer) error {
-		ref, err := findAttribute("href", tkz)
-
-		if err != nil {
-			return err
-		}
-
-		id, err := strconv.ParseUint(ref, 10, 32)
-
-		if err != nil {
-			return err
-		}
-
-		current.id = uint(id)
-		return nil
-	}
-
-	title := func(s string) error {
-		if len(s) == 0 {
-			return errors.New("Missing forum title")
-		}
-
-		current.title = s
-		return nil
-	}
-
-	// parser specification
-	var innerList parserFunc
-
-	innerList = maybe("ul",
-		repeat("li", seq(
-			addChild,
-			enter("span"),
-			enterAction("a", href),
-			textAction(title),
-			leave,
-			leave,
-			rec(&innerList),
-			stepUp,
-		)),
-	)
-
-	spec := seq(
-		textAction(nil),
-		repeat("ul", seq(
-			enter("li"),
-			addChild,
-			enter("span"),
-			enterAction("span", cTitle),
-			leave,
-			leave,
-			innerList,
-			leave,
-			stepUp,
-			textAction(nil)),
-		),
-	)
-
-	// parser invocation
-	if err := withTokenizer(fileName, spec); err != nil {
 		return nil, err
 	}
 
-	return root.children, nil
+	return &Tokenizer{tokenizer: html.NewTokenizer(reader)}, nil
 }
 
-// parser is composed of functions of this type
-type parserFunc func(*html.Tokenizer) error
-
-// sequence of parsers
-func seq(fns ...parserFunc) parserFunc {
-	return func(tkz *html.Tokenizer) error {
-		for _, fn := range fns {
-			if err := fn(tkz); err != nil {
-				return err
-			}
-		}
-
+// tokenizer iterator
+func (z *Tokenizer) Next() *Token {
+	if z.tokenizer == nil {
 		return nil
 	}
-}
 
-// recursive parser
-func rec(pfn *parserFunc) parserFunc {
-	return func(tkz *html.Tokenizer) error {
-		return (*pfn)(tkz)
-	}
-}
+	if z.inAttr {
+		z.token.Type = TokenAttribute
+		z.token.Key, z.token.Value, z.inAttr = z.tokenizer.TagAttr()
 
-// parser basic blocks
-func match(tt html.TokenType, tkz *html.Tokenizer) error {
-	switch t := tkz.Next(); t {
-	case html.ErrorToken:
-		return mapError(tkz.Err())
-	case tt:
-		return nil
-	default:
-		return fmt.Errorf("Unexpected token: %q instead of %q", t.String(), tt.String())
-	}
-}
+	} else if z.inShort {
+		z.inShort = false
+		z.token.Type = TokenEndTag
+		z.token.Key = nil
+		z.token.Value, _ = z.tokenizer.TagName()
 
-func leave(tkz *html.Tokenizer) error {
-	return match(html.EndTagToken, tkz)
-}
-
-// parser blocks constructors
-func leaveAction(fn func() error) parserFunc {
-	return func(tkz *html.Tokenizer) error {
-		if err := leave(tkz); err != nil {
-			return err
-		}
-
-		if fn != nil {
-			return fn()
-		}
-
-		return nil
-	}
-}
-
-func enter(tag string) parserFunc {
-	return enterAction(tag, nil)
-}
-
-func enterAction(tag string, attrAction parserFunc) parserFunc {
-	return func(tkz *html.Tokenizer) error {
-		if err := match(html.StartTagToken, tkz); err != nil {
-			return err
-		}
-
-		name, hasAttr := tkz.TagName()
-
-		if string(name) != tag {
-			return fmt.Errorf("Unexpected tag: %q instead of %q", string(name), tag)
-		}
-
-		if attrAction != nil {
-			if !hasAttr {
-				return errors.New("Missing attributes for tag " + string(name))
-			}
-
-			return attrAction(tkz)
-		}
-
-		return nil
-	}
-}
-
-func repeat(tag string, fn parserFunc) parserFunc {
-	return func(tkz *html.Tokenizer) error {
-		for {
-			switch tt := tkz.Next(); tt {
-			case html.ErrorToken:
-				return mapError(tkz.Err())
-
-			case html.StartTagToken:
-				name, _ := tkz.TagName()
-
-				if string(name) != tag {
-					return fmt.Errorf("Unexpected tag: %q instead of %q", string(name), tag)
-				}
-
-				if err := fn(tkz); err != nil {
-					return err
-				}
-
-			case html.EndTagToken:
-				return nil
-
-			default:
-				return errors.New("repeat: Unexpected token of type " + tt.String())
-			}
-		}
-	}
-}
-
-func maybe(tag string, fn parserFunc) parserFunc {
-	tail := seq(fn, leave)
-
-	return func(tkz *html.Tokenizer) error {
-		switch tt := tkz.Next(); tt {
+	} else {
+		switch z.tokenizer.Next() {
 		case html.ErrorToken:
-			return mapError(tkz.Err())
-
-		case html.StartTagToken:
-			name, _ := tkz.TagName()
-
-			if string(name) != tag {
-				return fmt.Errorf("Unexpected tag: %q instead of %q", string(name), tag)
-			}
-
-			return tail(tkz)
-
-		case html.EndTagToken:
+			*z = Tokenizer{Error: z.tokenizer.Err()}
 			return nil
 
-		default:
-			return errors.New("repeat: Unexpected token of type " + tt.String())
+		case html.StartTagToken:
+			z.token.Type = TokenStartTag
+			z.token.Key = nil
+			z.token.Value, z.inAttr = z.tokenizer.TagName()
+
+		case html.EndTagToken:
+			z.token.Type = TokenEndTag
+			z.token.Key = nil
+			z.token.Value, _ = z.tokenizer.TagName()
+
+		case html.SelfClosingTagToken:
+			z.inShort = true
+			z.token.Type = TokenStartTag
+			z.token.Key = nil
+			z.token.Value, z.inAttr = z.tokenizer.TagName() // can a self-closing tag have attributes?
+
+		case html.TextToken:
+			z.token = Token{
+				Type:  TokenText,
+				Value: z.tokenizer.Text(),
+			}
+
+		case html.CommentToken:
+			z.token = Token{
+				Type:  TokenComment,
+				Value: z.tokenizer.Text(),
+			}
+
+		case html.DoctypeToken:
+			z.token = Token{
+				Type:  TokenDoctype,
+				Value: z.tokenizer.Text(),
+			}
 		}
 	}
+
+	return &z.token
 }
 
-var spacer = regexp.MustCompile(`\s+`)
-
-func textAction(fn func(string) error) parserFunc {
-	return func(tkz *html.Tokenizer) error {
-		if err := match(html.TextToken, tkz); err != nil {
-			return err
-		}
-
-		if text := bytes.TrimSpace(tkz.Text()); len(text) > 0 && fn != nil {
-			return fn(string(spacer.ReplaceAllLiteral(text, []byte{' '})))
-		}
-
-		return nil
-	}
-}
-
-// find starting point
-func findAnchor(reader *html.Tokenizer) error {
+// find anchor tag
+func findAnchor(z *html.Tokenizer) (err error) {
 	for {
-		switch reader.Next() {
+		switch z.Next() {
 		case html.ErrorToken:
-			return mapError(reader.Err())
+			if err = z.Err(); err == io.EOF {
+				err = errors.New("Unexpected end of input")
+			}
+
+			return
 
 		case html.StartTagToken:
-			tag, hasAttr := reader.TagName()
+			tag, hasAttr := z.TagName()
 
-			if hasAttr && bytes.Compare(tag, []byte("div")) == 0 {
-				for {
-					attr, val, more := reader.TagAttr()
-
-					if bytes.Compare(attr, []byte("id")) == 0 && bytes.Compare(val, []byte("f-map")) == 0 {
-						return nil
-					}
-
-					if !more {
-						break
-					}
-				}
+			if bytes.Compare(tag, []byte("div")) == 0 && hasAttr && hasAttrValue(z, []byte("id"), []byte("f-map")) {
+				return
 			}
 		}
 	}
 }
 
-// attribute extractor
-func findAttribute(name string, tkz *html.Tokenizer) (string, error) {
-	val, more := matchAttribute(name, tkz)
+// check if the current opening tag has the specified attribute with the given value
+func hasAttrValue(z *html.Tokenizer, attr, val []byte) bool {
+	k, v, more := z.TagAttr()
+	found := bytes.Compare(k, attr) == 0 && bytes.Compare(v, val) == 0
 
-	for len(val) == 0 && more {
-		val, more = matchAttribute(name, tkz)
+	for !found && more {
+		k, v, more = z.TagAttr()
+		found = bytes.Compare(k, attr) == 0 && bytes.Compare(v, val) == 0
 	}
 
-	if len(val) > 0 {
-		return val, nil
-	}
-
-	return "", fmt.Errorf("Attribute %q is not found", name)
-}
-
-func matchAttribute(name string, tkz *html.Tokenizer) (string, bool) {
-	att, val, more := tkz.TagAttr()
-
-	if string(att) == name {
-		return string(val), more
-	}
-
-	return "", more
+	return found
 }
 
 // error handling
-func mapError(err error) error {
-	if err == io.EOF {
-		return errors.New("Unexpected end of file")
-	}
-
-	return err
-}
-
 func die(err error) {
 	os.Stderr.WriteString("ERROR: " + err.Error() + "\n")
 	os.Exit(1)
